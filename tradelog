@@ -1,0 +1,299 @@
+#!/bin/sh
+
+# IOS project 1
+# author: Patrik Korytar
+# school: FIT VUT
+# date: 28.3.2021
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+### FUNCTIONS
+
+# print help
+print_help()
+{
+  echo "Usage:  ./tradelog [-h|--help]"
+  echo "        ./tradelog [FILTER] [COMMAND] [LOG [LOG [...]]"
+  echo "Analyze stock-exchange records."
+  echo ""
+  echo "Options:"
+  echo "        -h / --help -- print help"
+  echo ""
+  echo "Filters:"
+  echo "        -a DATETIME -- print just records after this date and time"
+  echo "        -b DATETIME -- print just records before this date and time"
+  echo "        -t TICKER   -- print just this ticker (multiple can be set)"
+  echo "        -w WIDTH    -- set width of histogram / graph"
+  echo ""
+  echo "Commands (can be one of):"
+  echo "        list-tick   -- list all tickers"
+  echo "        profit      -- print overall profit from all positions"
+  echo "        pos         -- list values of current tickers' positions"
+  echo "        last-price  -- list last known tickers' prices"
+  echo "        hist-ord    -- show histogram of number of tickers' transactions"
+  echo "        graph-pos   -- show graph of values of current tickers' positions"
+}
+
+# check if file exists; if not, end program
+file_exists()
+{
+  find "$1" 1>/dev/null 2>/dev/null
+  if [ "$?" -eq 1 ] # if the above find failed, ie if there is no such a file
+  then
+    echo "tradelog: $1: no such file"
+    exit 1
+  fi
+}
+
+# compare two dates; return: 1 if first date is newer, 2 if second date is newer, 0 if same
+compare_date()
+{
+  awk -v first="$1" -v second="$2" 'BEGIN{ if(first > second) print 1; else if(fist < second) print 2; else print 0 }'
+}
+
+### VARIABLES
+
+DATETIME_AFTER="0000-00-00 00:00:00"
+DATIME_BEFORE="9999-99-99 99:99:99"
+TICKERS=""
+WIDTH=""
+
+CMD=""
+
+LOG_LOADED=0 # 0 if not loaded, 1 if loaded
+DATA=""
+
+### PROCESS ARGUMENTS
+
+while [ "$#" -gt 0 ] # while there are arguments left
+do
+  case "$1" in
+  -h | --help)
+    print_help
+    exit 0
+    ;;
+  -a) # if multiple -a are given, intersection is set (ie the newest date)
+    CMP=$(compare_date "$2" "$DATETIME_AFTER")
+    if [ "$CMP" -eq 1 ] # if date in argument is newer than current date
+    then
+      DATETIME_AFTER="$2"
+    fi
+
+    shift # shift -a argument
+    shift # shift DATETIME argument
+    ;;
+  -b) # if multiple -b are given, intersection is set (ie the oldest date)
+    CMP=$(compare_date "$2" "$DATIME_BEFORE")
+    if [ "$CMP" -eq 2 ] # if date in argument is older than current date
+    then
+      DATIME_BEFORE="$2"
+    fi
+
+    shift
+    shift
+    ;;
+  -t)
+    TICKERS="$TICKERS|$2"
+    shift
+    shift
+    ;;
+  -w)
+    if [ "$WIDTH" ] # max one WIDTH allowed
+    then
+      echo "tradelog: WIDTH already set"
+      exit 1
+    fi
+
+    if ! [ "$2" -eq "$2" ] 2>/dev/null # WIDTH not a number
+    then
+      echo "tradelog: WIDTH must be a number"
+      exit 1
+    fi
+
+    if [ "$2" -lt 0 ] # WIDTH less than zero
+    then
+      echo "tradelog: WIDTH must be positive number"
+      exit 1
+    fi
+
+    WIDTH="$2"
+    shift
+    shift
+    ;;
+  list-tick | profit | pos | last-price | hist-ord | graph-pos)
+    if [ "$CMD" ] # max one COMMAND allowed
+    then
+      echo "tradelog: COMMAND already set"
+      exit 1
+    fi
+
+    CMD="$1"
+    shift
+    ;;
+  *.gz )
+    file_exists "$1"
+    DATA="${DATA}$(gzip -d -c "$1")" # load from decompressed .gz file and append to rest of loaded data
+    LOG_LOADED=1
+    shift
+    ;;
+  *)
+    file_exists "$1"
+    DATA=$(echo "$DATA" | cat - "$1") # load from file and append to rest of loaded data
+    LOG_LOADED=1
+    shift
+    ;;
+  esac
+done
+
+if [ "$LOG_LOADED" -eq 0 ] # if no file specified
+then
+  DATA=$(cat -) # load from stdin
+fi
+
+### FILTERS
+
+DATA=$(echo "$DATA" | awk -F \; -v datetime_after="$DATETIME_AFTER" '{ if($1 > datetime_after) print $0; }')
+DATA=$(echo "$DATA" | awk -F \; -v datetime_before="$DATIME_BEFORE" '{ if($1 < datetime_before) print $0; }')
+
+if [ -z "$TICKERS" ] # if no ticker specified
+then
+  TICKERS=".*" # regex for all tickers
+fi
+DATA=$(echo "$DATA" | awk -F \; -v filter="^($TICKERS)$" '{ if($2 ~ filter) print $0; }') # filter tickers using regex
+
+### COMMANDS
+
+case "$CMD" in
+list-tick) # get all tickers, sort them and print just unique
+  DATA=$(echo "$DATA" | awk -F \; '{ print $2; }' | sort | uniq)
+  ;;
+profit) # compute overall profit and print it
+  DATA=$(echo "$DATA" | awk -F \; \
+  ' {
+      if($3 == "sell") sold += $4 * $6;
+      if($3 == "buy") bought += $4 * $6;
+    }
+
+    END {
+      printf("%.2f", sold - bought);
+    } ')
+  ;;
+pos) # sort dates, compute values of current tickers' positions and print for each ticker sorted using values
+  DATA=$(echo "$DATA" | sort -t \; -k1,1 | awk -F \; \
+  ' {
+      if($3 == "buy") count[$2] += $6;
+      if($3 == "sell") count[$2] -= $6;
+      price[$2] = $4; # dates are sorted, so last price is always last for each ticker
+    }
+
+    END {
+      numlen = 0;
+      for(i in count)
+      {
+        pos[i] = sprintf("%.2f", count[i] * price[i]);
+        if(length(pos[i]) > numlen) numlen = length(pos[i]);
+      }
+
+      for(i in pos)
+        printf("%-10s: %*.2f\n", i, numlen, pos[i]);
+    } ' | sort -n -r -t : -k2,2)
+  ;;
+last-price) # sort dates, find last known tickers' prices and print for each ticker sorted
+  DATA=$(echo "$DATA" | sort -t \; -k1,1 | awk -F \; \
+  ' {
+      price[$2] = sprintf("%.2f", $4); # dates are sorted, so last price is always last for each ticker
+    }
+
+    END {
+      numlen = 0;
+      for(i in price)
+        if(length(price[i]) > numlen) numlen = length(price[i]);
+      for(i in price)
+        printf("%-10s: %*.2f\n", i, numlen, price[i]);
+    } ' | sort)
+  ;;
+hist-ord) # compute number of tickers' transactions and show histogram for each ticker sorted
+  DATA=$(echo "$DATA" | awk -F \; -v width="$WIDTH" \
+  ' {
+      count[$2]++;
+    }
+
+    END {
+      if(length(width) != 0) # only needed when WIDTH set
+      {
+        max = 0;
+        for(i in count)
+          if(count[i] > max) max = count[i];
+      }
+
+      for(i in count)
+      {
+        printf("%-10s:", i);
+
+        if(length(width) == 0) # WIDTH not set
+          len = count[i];
+        else # WIDTH set
+          len = int((count[i] / max) * width);
+
+        if(len != 0) # print space only if histogram follows
+          printf(" ");
+        for(j = 0; j < len; j++)
+          printf("#");
+
+        printf("\n");
+      }
+    } ' | sort)
+  ;;
+graph-pos) # sort dates, compute values of current tickers' positions and show graph for each ticker sorted
+  DATA=$(echo "$DATA" | sort -t \; -k1,1 | awk -F \; -v width="$WIDTH" \
+  ' function abs(x)
+    {
+      return x < 0 ? -x : x;
+    }
+
+    {
+      if($3 == "buy") count[$2] += $6;
+      if($3 == "sell") count[$2] -= $6;
+      price[$2] = $4; # dates are sorted, so last price is always last for each ticker
+    }
+
+    END {
+      max = 0;
+      for(i in count)
+      {
+        pos[i] = count[i] * price[i];
+        if(length(width) != 0) # only needed when WIDTH set
+          if(abs(pos[i]) > max) max = abs(pos[i]);
+      }
+
+      for(i in count)
+      {
+        printf("%-10s:", i);
+
+        if(length(width) == 0) # WIDTH not set
+          len = int(abs(pos[i]) / 1000);
+        else # WIDTH set
+          len = int((abs(pos[i]) / max) * width);
+
+        if(len != 0) # print space only if graph follows
+          printf(" ");
+        for(j = 0; j < len; j++)
+        {
+          if(pos[i] > 0)
+            printf "#";
+          else
+            printf "!";
+        }
+
+        printf("\n");
+      }
+    } ' | sort)
+  ;;
+esac
+
+### PRINT ALL DATA
+
+echo "$DATA"
+
+exit 0
